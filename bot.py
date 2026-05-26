@@ -146,7 +146,23 @@ async def send_long_message(message, text: str):
         for i, part in enumerate(parts):
             await message.reply_text(f"Часть {i+1}/{len(parts)}:\n{part}")
 
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
+
+def run_health_server():
+    server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
+    server.serve_forever()
+
 def main():
+    threading.Thread(target=run_health_server, daemon=True).start()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE | filters.VIDEO | filters.Document.ALL, handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
