@@ -335,13 +335,16 @@ def run_health_server():
     server = HTTPServer(("0.0.0.0", 8080), HealthHandler)
     server.serve_forever()
 
+async def post_init(application):
+    await application.bot.delete_webhook(drop_pending_updates=True)
+
 def main():
     threading.Thread(target=run_health_server, daemon=True).start()
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_TOKEN).post_init(post_init).build()
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE | filters.VIDEO | filters.Document.ALL, handle_audio))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(CallbackQueryHandler(handle_format_choice))
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
