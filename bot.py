@@ -1,10 +1,12 @@
 import os
 import logging
-import asyncio
 import tempfile
+import subprocess
 import httpx
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -14,7 +16,52 @@ GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 
 SUPPORTED_EXTENSIONS = [".mp3", ".mp4", ".wav", ".m4a", ".ogg", ".webm", ".mpeg", ".mpga"]
 
-async def transcribe_file(file_path: str) -> str:
+def convert_to_audio(file_path: str) -> str:
+    ext = os.path.splitext(file_path)[1].lower()
+    audio_path = file_path + ".mp3"
+    subprocess.run([
+        "ffmpeg", "-i", file_path,
+        "-vn", "-acodec", "mp3",
+        "-ab", "64k", "-ar", "16000",
+        "-y", audio_path
+    ], capture_output=True)
+    return audio_path
+
+def split_audio(file_path: str, chunk_minutes: int = 10) -> list:
+    chunk_seconds = chunk_minutes * 60
+    duration_result = subprocess.run([
+        "ffprobe", "-v", "quiet",
+        "-show_entries", "format=duration",
+        "-of", "csv=p=0", file_path
+    ], capture_output=True, text=True)
+    
+    try:
+        duration = float(duration_result.stdout.strip())
+    except:
+        return [file_path]
+    
+    if duration <= chunk_seconds:
+        return [file_path]
+    
+    chunks = []
+    start = 0
+    index = 0
+    while start < duration:
+        chunk_path = file_path + f"_chunk{index}.mp3"
+        subprocess.run([
+            "ffmpeg", "-i", file_path,
+            "-ss", str(start),
+            "-t", str(chunk_seconds),
+            "-acodec", "mp3", "-ab", "64k", "-ar", "16000",
+            "-y", chunk_path
+        ], capture_output=True)
+        chunks.append((chunk_path, start))
+        start += chunk_seconds
+        index += 1
+    
+    return chunks
+
+async def transcribe_chunk(file_path: str, offset_seconds: float = 0) -> str:
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     
@@ -35,11 +82,11 @@ async def transcribe_file(file_path: str) -> str:
     segments = data.get("segments", [])
     
     if not segments:
-        return data.get("text", "Текст не распознан")
+        return data.get("text", "")
     
     lines = []
     for seg in segments:
-        start = int(seg["start"])
+        start = int(seg["start"] + offset_seconds)
         minutes = start // 60
         seconds = start % 60
         timestamp = f"[{minutes:02d}:{seconds:02d}]"
@@ -47,29 +94,43 @@ async def transcribe_file(file_path: str) -> str:
     
     return "\n".join(lines)
 
-async def download_from_url(url: str) -> str:
-    async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-        response = await client.get(url)
+async def process_file(file_path: str, message) -> str:
+    ext = os.path.splitext(file_path)[1].lower()
     
-    if response.status_code != 200:
-        raise Exception(f"Не удалось скачать файл: {response.status_code}")
+    # Конвертируем видео в аудио
+    if ext in [".mp4", ".webm", ".mpeg", ".mov"]:
+        await message.reply_text("🎬 Извлекаю аудио из видео...")
+        audio_path = convert_to_audio(file_path)
+        os.unlink(file_path)
+    else:
+        audio_path = file_path
     
-    content_type = response.headers.get("content-type", "")
-    ext = ".mp3"
-    if "mp4" in content_type or "video" in content_type:
-        ext = ".mp4"
-    elif "ogg" in content_type:
-        ext = ".ogg"
-    elif "wav" in content_type:
-        ext = ".wav"
+    # Нарезаем на куски
+    chunks = split_audio(audio_path)
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
-        tmp.write(response.content)
-        return tmp.name
+    if isinstance(chunks[0], tuple):
+        # Несколько кусков
+        total = len(chunks)
+        await message.reply_text(f"✂️ Файл большой, нарезал на {total} частей по 10 минут. Транскрибирую...")
+        
+        all_text = []
+        for i, (chunk_path, offset) in enumerate(chunks):
+            await message.reply_text(f"⏳ Обрабатываю часть {i+1}/{total}...")
+            text = await transcribe_chunk(chunk_path, offset)
+            all_text.append(text)
+            os.unlink(chunk_path)
+        
+        os.unlink(audio_path)
+        return "\n".join(all_text)
+    else:
+        # Один файл
+        text = await transcribe_chunk(audio_path)
+        os.unlink(audio_path)
+        return text
 
 async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
-    await message.reply_text("⏳ Получил файл, начинаю транскрибацию...")
+    await message.reply_text("⏳ Получил файл, начинаю обработку...")
     
     try:
         audio = message.audio or message.voice or message.video or message.document
@@ -86,11 +147,8 @@ async def handle_audio(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tmp_path = tmp.name
         
         await tg_file.download_to_drive(tmp_path)
-        
-        text = await transcribe_file(tmp_path)
-        os.unlink(tmp_path)
-        
-        await send_long_message(message, text)
+        result = await process_file(tmp_path, message)
+        await send_long_message(message, result)
     
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -105,26 +163,40 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Привет! Отправь мне:\n"
             "• Аудио или голосовое сообщение\n"
             "• Видео или файл\n"
-            "• Ссылку на Google Drive или любой публичный файл"
+            "• Ссылку на Google Drive"
         )
         return
     
-    await message.reply_text("⏳ Скачиваю файл по ссылке...")
+    await message.reply_text("⏳ Скачиваю файл...")
     
     try:
-        # Конвертируем ссылку Google Drive в прямую
         if "drive.google.com" in text:
             if "/file/d/" in text:
                 file_id = text.split("/file/d/")[1].split("/")[0]
                 text = f"https://drive.google.com/uc?export=download&id={file_id}"
         
-        tmp_path = await download_from_url(text)
-        await message.reply_text("✅ Файл скачан, транскрибирую...")
+        async with httpx.AsyncClient(timeout=600, follow_redirects=True) as client:
+            response = await client.get(text)
         
-        text_result = await transcribe_file(tmp_path)
-        os.unlink(tmp_path)
+        if response.status_code != 200:
+            raise Exception(f"Не удалось скачать файл: {response.status_code}")
         
-        await send_long_message(message, text_result)
+        content_type = response.headers.get("content-type", "")
+        ext = ".mp3"
+        if "mp4" in content_type or "video" in content_type:
+            ext = ".mp4"
+        elif "ogg" in content_type:
+            ext = ".ogg"
+        elif "wav" in content_type:
+            ext = ".wav"
+        
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            tmp.write(response.content)
+            tmp_path = tmp.name
+        
+        await message.reply_text("✅ Файл скачан, обрабатываю...")
+        result = await process_file(tmp_path, message)
+        await send_long_message(message, result)
     
     except Exception as e:
         logger.error(f"Error: {e}")
@@ -145,9 +217,6 @@ async def send_long_message(message, text: str):
         
         for i, part in enumerate(parts):
             await message.reply_text(f"Часть {i+1}/{len(parts)}:\n{part}")
-
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
